@@ -12,7 +12,6 @@
  * ---------------------------------------------------------------------------- */
 
 use GuzzleHttp\Exception\GuzzleException;
-use Jsvrcek\ICS\Exception\CalendarEventException;
 
 /**
  * Caldav controller.
@@ -88,7 +87,7 @@ class Caldav extends EA_Controller
      *
      * @return void
      *
-     * @throws CalendarEventException
+     * @throws \Jsvrcek\ICS\Exception\CalendarEventException
      * @throws Exception
      * @throws Throwable
      */
@@ -151,10 +150,6 @@ class Caldav extends EA_Controller
         // Sync each appointment with CalDAV Calendar by following the project's sync protocol (see documentation).
 
         foreach ($local_events as $local_event) {
-            if (str_contains((string) $local_event['id_caldav_calendar'], 'RECURRENCE')) {
-                continue;
-            }
-
             if (!$local_event['is_unavailability']) {
                 $service = $CI->services_model->find($local_event['id_services']);
                 $customer = $CI->customers_model->find($local_event['id_users_customer']);
@@ -164,6 +159,8 @@ class Caldav extends EA_Controller
                 $customer = null;
                 $events_model = $CI->unavailabilities_model;
             }
+
+            // If current appointment not synced yet, add to CalDAV Calendar.
 
             if (!$local_event['id_caldav_calendar']) {
                 if (!$local_event['is_unavailability']) {
@@ -184,7 +181,7 @@ class Caldav extends EA_Controller
             try {
                 $caldav_event = $CI->caldav_sync->get_event($provider, $local_event['id_caldav_calendar']);
 
-                if (!$caldav_event || $caldav_event['status'] === 'CANCELLED') {
+                if ($caldav_event['status'] === 'CANCELLED') {
                     throw new Exception('Event is cancelled, remove the record from Easy!Appointments.');
                 }
 
@@ -195,15 +192,19 @@ class Caldav extends EA_Controller
                 $caldav_event_start = new DateTime($caldav_event['start_datetime']);
                 $caldav_event_end = new DateTime($caldav_event['end_datetime']);
 
+                $caldav_event_notes = $local_event['is_unavailability']
+                    ? $caldav_event['summary'] . ' ' . $caldav_event['description']
+                    : $caldav_event['description'];
+
                 $is_different =
                     $local_event_start !== $caldav_event_start->getTimestamp() ||
                     $local_event_end !== $caldav_event_end->getTimestamp() ||
-                    $local_event['notes'] !== $caldav_event['description'];
+                    $local_event['notes'] !== $caldav_event_notes;
 
                 if ($is_different) {
                     $local_event['start_datetime'] = $caldav_event_start->format('Y-m-d H:i:s');
                     $local_event['end_datetime'] = $caldav_event_end->format('Y-m-d H:i:s');
-                    $local_event['notes'] = $caldav_event['description'];
+                    $local_event['notes'] = $caldav_event_notes;
                     $events_model->save($local_event);
                 }
             } catch (Throwable) {
@@ -227,46 +228,70 @@ class Caldav extends EA_Controller
                 throw $e;
             }
         }
-
-        $CI->appointments_model->delete_caldav_recurring_events($start_date_time, $end_date_time);
-
-        foreach ($caldav_events as $caldav_event) {
-            if ($caldav_event['status'] === 'CANCELLED') {
-                continue;
+        print_r($caldav_events, true);
+        log_message('info', var_export($caldav_events, true)); 
+        log_message('info', 'Starting CalDAV event processing');
+        
+        try {
+            foreach ($caldav_events as $caldav_event) {
+                log_message('debug', 'Processing CalDAV event: ' . PHP_EOL .
+                    'Start: ' . ($caldav_event['start_datetime'] ?? 'unknown') . PHP_EOL .
+                    'End: ' . ($caldav_event['end_datetime'] ?? 'unknown') . PHP_EOL .
+                    'Summary: ' . ($caldav_event['summary'] ?? 'no summary') . PHP_EOL .
+                    'Status: ' . ($caldav_event['status'] ?? 'no status')
+                );
+        
+                if ($caldav_event['status'] === 'CANCELLED') {
+                    log_message('debug', 'Skipping cancelled event');
+                    continue;
+                }
+        
+                if ($caldav_event['start_datetime'] === $caldav_event['end_datetime']) {
+                    log_message('debug', 'Skipping event with identical start/end times');
+                    continue;
+                }
+        
+                // Check for existing events
+                $existing_appointment = $CI->appointments_model->get(['id_caldav_calendar' => $caldav_event['id']]);
+                $existing_unavailability = $CI->unavailabilities_model->get(['id_caldav_calendar' => $caldav_event['id']]);
+        
+                if (!empty($existing_appointment) || !empty($existing_unavailability)) {
+                    log_message('debug', 'Event already exists in system - ' . 
+                        'Appointments: ' . (!empty($existing_appointment) ? 'Yes' : 'No') . 
+                        ' Unavailabilities: ' . (!empty($existing_unavailability) ? 'Yes' : 'No'));
+                    continue;
+                }
+        
+                // Create unavailability
+                $local_event = [
+                    'start_datetime' => $caldav_event['start_datetime'],
+                    'end_datetime' => $caldav_event['end_datetime'],
+                    'location' => $caldav_event['location'] ?? '',
+                    'notes' => trim(($caldav_event['summary'] ?? '') . ' ' . ($caldav_event['description'] ?? '')),
+                    'id_users_provider' => $provider_id,
+                    'id_caldav_calendar' => $caldav_event['id'],
+                    'is_unavailability' => true,
+                    'book_datetime' => date('Y-m-d H:i:s')
+                ];
+        
+                log_message('debug', 'Attempting to create unavailability with data: ' . PHP_EOL . 
+                    var_export($local_event, true));
+        
+                try {
+                    $CI->unavailabilities_model->save($local_event);
+                    log_message('debug', 'Successfully created unavailability for time slot: ' . 
+                        $caldav_event['start_datetime'] . ' to ' . $caldav_event['end_datetime']);
+                } catch (Exception $e) {
+                    log_message('debug', 'Failed to create unavailability: ' . $e->getMessage() . PHP_EOL .
+                        'Stack trace: ' . $e->getTraceAsString());
+                }
             }
-
-            if ($caldav_event['start_datetime'] === $caldav_event['end_datetime']) {
-                continue; // Cannot sync events with the same start and end date time value
-            }
-
-            $appointment_results = $CI->appointments_model->get(['id_caldav_calendar' => $caldav_event['id']]);
-
-            if (!empty($appointment_results)) {
-                continue;
-            }
-
-            $unavailability_results = $CI->unavailabilities_model->get([
-                'id_caldav_calendar' => $caldav_event['id'],
-            ]);
-
-            if (!empty($unavailability_results)) {
-                continue;
-            }
-
-            // Record doesn't exist in the Easy!Appointments, so add the event now.
-
-            $local_event = [
-                'start_datetime' => $caldav_event['start_datetime'],
-                'end_datetime' => $caldav_event['end_datetime'],
-                'location' => $caldav_event['location'],
-                'notes' => $caldav_event['summary'] . ' ' . $caldav_event['description'],
-                'id_users_provider' => $provider_id,
-                'id_caldav_calendar' => $caldav_event['id'],
-            ];
-
-            $CI->unavailabilities_model->save($local_event);
+        } catch (Exception $e) {
+            log_message('debug', 'Error processing CalDAV events: ' . $e->getMessage() . PHP_EOL .
+                'Stack trace: ' . $e->getTraceAsString());
         }
-
+        
+        
         json_response([
             'success' => true,
         ]);

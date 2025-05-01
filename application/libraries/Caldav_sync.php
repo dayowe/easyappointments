@@ -196,134 +196,70 @@ class Caldav_sync
         try {
             $client = $this->get_http_client_by_provider_id($provider['id']);
             $provider_timezone_object = new DateTimeZone($provider['timezone']);
-
+    
             $response = $this->fetch_events($client, $start_date_time, $end_date_time);
-
-            if (!$response->getBody()) {
-                log_message('error', 'No response body from fetch_events' . PHP_EOL);
-                return [];
-            }
-
-            $xml = new SimpleXMLElement($response->getBody(), 0, false, 'd', true);
-
-            if ($xml->children('d', true)) {
-                return $this->parse_xml_events($xml, $start_date_time, $end_date_time, $provider_timezone_object);
-            }
-
-            $ics_file_urls = $this->extract_ics_file_urls($response->getBody());
-            return $this->fetch_and_parse_ics_files(
-                $client,
-                $ics_file_urls,
-                $start_date_time,
-                $end_date_time,
-                $provider_timezone_object,
-            );
-        } catch (GuzzleException $e) {
-            $this->handle_guzzle_exception($e, 'Failed to get CalDAV sync events');
-            return [];
-        }
-    }
-
-    private function parse_xml_events(
-        SimpleXMLElement $xml,
-        string $start_date_time,
-        string $end_date_time,
-        DateTimeZone $timezone,
-    ): array {
-        $events = [];
-
-        foreach ($xml->children('d', true) as $response) {
-            $ics_contents = (string) $response->propstat->prop->children('cal', true);
-
-            $events = array_merge(
-                $events,
-                $this->expand_ics_content($ics_contents, $start_date_time, $end_date_time, $timezone),
-            );
-        }
-
-        return $events;
-    }
-
-    private function extract_ics_file_urls(string $body): array
-    {
-        $ics_files = [];
-        $lines = explode("\n", $body);
-        foreach ($lines as $line) {
-            if (preg_match('/\/calendars\/.*?\.ics/', $line, $matches)) {
-                $ics_files[] = $matches[0];
-            }
-        }
-        return $ics_files;
-    }
-
-    /**
-     * Fetch and parse the ICS files from the remote server
-     *
-     * @param Client $client
-     * @param array $ics_file_urls
-     * @param string $start_date_time
-     * @param string $end_date_time
-     * @param DateTimeZone $timezone_OBJECT
-     *
-     * @return array
-     */
-    private function fetch_and_parse_ics_files(
-        Client $client,
-        array $ics_file_urls,
-        string $start_date_time,
-        string $end_date_time,
-        DateTimeZone $timezone_OBJECT,
-    ): array {
-        $events = [];
-
-        foreach ($ics_file_urls as $ics_file_url) {
-            try {
-                $ics_response = $client->request('GET', $ics_file_url);
-
-                $ics_contents = $ics_response->getBody()->getContents();
-
-                if (empty($ics_contents)) {
-                    log_message('error', 'ICS file data is empty for URL: ' . $ics_file_url . PHP_EOL);
-                    continue;
+            $response_body = $response->getBody()->getContents();
+            
+            // Parse the XML response
+            $xml = new SimpleXMLElement($response_body);
+            $xml->registerXPathNamespace('d', 'DAV:');
+            $xml->registerXPathNamespace('c', 'urn:ietf:params:xml:ns:caldav');
+            
+            $events = [];
+            
+            // Find all calendar-data elements
+            foreach ($xml->xpath('//c:calendar-data') as $calendar_data) {
+                $ical_data = (string)$calendar_data;
+                log_message('debug', 'Processing iCal data block');
+                
+                try {
+                    // Parse the iCal data
+                    $vcalendar = Reader::read($ical_data);
+                    
+                    // Process each VEVENT in the calendar
+                    foreach ($vcalendar->VEVENT as $vevent) {
+                        try {
+                            // Get event start and end times
+                            $start = $vevent->DTSTART->getDateTime();
+                            $end = $vevent->DTEND->getDateTime();
+                            
+                            // Convert to provider's timezone
+                            $start->setTimezone($provider_timezone_object);
+                            $end->setTimezone($provider_timezone_object);
+                            
+                            $event = [
+                                'id' => (string)$vevent->UID,
+                                'start_datetime' => $start->format('Y-m-d H:i:s'),
+                                'end_datetime' => $end->format('Y-m-d H:i:s'),
+                                'summary' => (string)$vevent->SUMMARY ?? '',
+                                'description' => (string)$vevent->DESCRIPTION ?? '',
+                                'location' => (string)$vevent->LOCATION ?? '',
+                                'status' => (string)$vevent->STATUS ?? 'CONFIRMED'
+                            ];
+                            
+                            log_message('debug', 'Parsed event: ' . json_encode($event));
+                            $events[] = $event;
+                            
+                        } catch (Exception $e) {
+                            log_message('error', 'Error parsing individual event: ' . $e->getMessage());
+                            continue; // Skip this event but continue with others
+                        }
+                    }
+                } catch (Exception $e) {
+                    log_message('error', 'Error parsing iCal data: ' . $e->getMessage());
+                    continue; // Skip this calendar data but continue with others
                 }
-
-                $events = array_merge(
-                    $events,
-                    $this->expand_ics_content($ics_contents, $start_date_time, $end_date_time, $timezone_OBJECT),
-                );
-            } catch (GuzzleException $e) {
-                log_message(
-                    'error',
-                    'Failed to fetch ICS content from ' . $ics_file_url . ': ' . $e->getMessage() . PHP_EOL,
-                );
             }
+            
+            log_message('info', 'Successfully parsed ' . count($events) . ' events from CalDAV response');
+            return $events;
+            
+        } catch (Exception $e) {
+            log_message('error', 'Error in get_sync_events: ' . $e->getMessage());
+            throw $e;
         }
-
-        return $events;
     }
-
-    private function expand_ics_content(
-        string $ics_contents,
-        string $start_date_time,
-        string $end_date_time,
-        DateTimeZone $timezone_object,
-    ): array {
-        $events = [];
-
-        try {
-            $vcalendar = Reader::read($ics_contents);
-
-            $expanded_vcalendar = $vcalendar->expand(new DateTime($start_date_time), new DateTime($end_date_time));
-
-            foreach ($expanded_vcalendar->VEVENT as $event) {
-                $events[] = $this->convert_caldav_event_to_array_event($event, $timezone_object);
-            }
-        } catch (Throwable $e) {
-            log_message('error', 'Failed to parse or expand calendar data: ' . $e->getMessage() . PHP_EOL);
-        }
-
-        return $events;
-    }
+    
 
     /**
      * Common error handling for the CalDAV requests.
@@ -548,38 +484,61 @@ class Caldav_sync
      * @throws GuzzleException
      * @throws Exception
      */
-    private function fetch_events(Client $client, string $start_date_time, string $end_date_time): ResponseInterface
-    {
-        $start_date_time_object = new DateTime($start_date_time);
-        $formatted_start_date_time = $start_date_time_object->format('Ymd\THis\Z');
-        $end_date_time_object = new DateTime($end_date_time);
-        $formatted_end_date_time = $end_date_time_object->format('Ymd\THis\Z');
-
-        return $client->request('REPORT', '', [
+    private function fetch_events(Client $client, string $start_date_time, string $end_date_time): ResponseInterface {
+        $formatted_start_date_time = (new DateTime($start_date_time))->format('Ymd\THis\Z');
+        $formatted_end_date_time = (new DateTime($end_date_time))->format('Ymd\THis\Z');
+    
+        $requestBody = <<<XML
+    <?xml version="1.0" encoding="utf-8"?>
+    <C:calendar-query xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
+    <D:prop>
+        <D:getetag/>
+        <C:calendar-data/>
+    </D:prop>
+    <C:filter>
+        <C:comp-filter name="VCALENDAR">
+            <C:comp-filter name="VEVENT">
+                <C:time-range start="{$formatted_start_date_time}" end="{$formatted_end_date_time}"/>
+            </C:comp-filter>
+        </C:comp-filter>
+    </C:filter>
+    </C:calendar-query>
+    XML;
+    
+        $response = $client->request('REPORT', '', [
             'headers' => [
-                'Content-Type' => 'application/xml',
+                'Content-Type' => 'application/xml; charset=UTF-8',
                 'Depth' => '1',
             ],
-            'body' =>
-                '
-                <c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
-                    <d:prop>
-                        <d:getetag />
-                        <c:calendar-data />
-                    </d:prop>
-                    <c:filter>
-                        <c:comp-filter name="VCALENDAR">
-                            <c:comp-filter name="VEVENT">
-                                <c:time-range start="' .
-                $formatted_start_date_time .
-                '" end="' .
-                $formatted_end_date_time .
-                '"/>	
-                            </c:comp-filter>
-                        </c:comp-filter>
-                    </c:filter>
-                </c:calendar-query>
-            ',
+            'body' => $requestBody,
         ]);
+    
+        // Get response body content first
+        $responseBody = $response->getBody()->getContents();
+        
+        // Log debugging info
+        log_message('info', "Formatted start date-time: $formatted_start_date_time");
+        log_message('info', "Formatted end date-time: $formatted_end_date_time");
+        log_message('info', "Sending CalDAV REPORT request with body: $requestBody");
+        log_message('info', "Full CalDAV Response: " . $responseBody);
+    
+        // Create a new response with the same body content
+        return $response->withBody(\GuzzleHttp\Psr7\Utils::streamFor($responseBody));
+    }
+
+    /**
+     * Clean up old CalDAV unavailabilities
+     *
+     * @param int $provider_id
+     * @param string $before_date
+     */
+    private function cleanup_old_caldav_unavailabilities(int $provider_id, string $before_date): void
+    {
+        $this->db
+            ->where('id_users_provider', $provider_id)
+            ->where('is_unavailability', true)
+            ->where('end_datetime <', $before_date)
+            ->like('notes', 'CalDAV Event:', 'after')
+            ->delete('appointments');
     }
 }

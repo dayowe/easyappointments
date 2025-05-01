@@ -227,7 +227,11 @@ class Email_messages
         ?string $html = null,
     ): PHPMailer {
         $php_mailer = new PHPMailer(true);
-
+        $php_mailer->Timeout = 10; // 10 seconds
+        // redirect SMTP debug output to error log instead of output
+        $php_mailer->Debugoutput = function($str, $level) {
+            log_message('debug', "PHPMailer [$level] : $str");
+        };
         $php_mailer->isHTML();
         $php_mailer->CharSet = 'UTF-8';
         $php_mailer->SMTPDebug = config('smtp_debug') ? SMTP::DEBUG_SERVER : null;

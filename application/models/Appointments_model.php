@@ -645,4 +645,46 @@ class Appointments_model extends EA_Model
 
         $appointment = $decoded_request;
     }
+    /**
+     * Add or update unavailability period from CalDAV event
+     *
+     * @param array $event CalDAV event data
+     * @param int $provider_id Provider ID
+     *
+     * @return int Returns the unavailability ID
+     */
+    public function add_caldav_unavailability(array $event, int $provider_id): int
+    {
+        $unavailability = [
+            'start_datetime' => $event['start_datetime'],
+            'end_datetime' => $event['end_datetime'],
+            'notes' => 'CalDAV Event: ' . ($event['summary'] ?? 'Busy'),
+            'id_users_provider' => $provider_id,
+            'is_unavailability' => true,
+            'location' => $event['location'] ?? '',
+            'id_caldav_calendar' => $event['id'] ?? null,
+            'book_datetime' => date('Y-m-d H:i:s'),
+            'create_datetime' => date('Y-m-d H:i:s'),
+            'update_datetime' => date('Y-m-d H:i:s')
+        ];
+
+        // Check if this CalDAV event already exists as an unavailability
+        $existing = $this->db
+            ->where('id_caldav_calendar', $event['id'])
+            ->where('is_unavailability', true)
+            ->get('appointments')
+            ->row_array();
+
+        if ($existing) {
+            // Update existing unavailability
+            $unavailability['id'] = $existing['id'];
+            $this->db->update('appointments', $unavailability, ['id' => $existing['id']]);
+            return $existing['id'];
+        } else {
+            // Insert new unavailability
+            $this->db->insert('appointments', $unavailability);
+            return $this->db->insert_id();
+        }
+    }
+
 }
